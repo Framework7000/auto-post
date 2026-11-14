@@ -183,7 +183,7 @@ function syncSite_() {
     if (o.cover) it.coverUrl = SITE + o.cover; else if (c.cover) it.coverUrl = SITE + '/' + c.cover;   // a cover changed in the pencil popup wins
     var posted = Object.keys(it.done || {}).length > 0;
     if (!posted && it.fileId !== c.fileId) { it.fileId = c.fileId; }
-    [row.done || {}, o.done || {}].forEach(function (dn) { Object.keys(dn).forEach(function (p) { if (dn[p] && dn[p] !== 'skip') { it.done = it.done || {}; if (!it.done[p]) it.done[p] = dn[p]; } }); });   // posted by hand = never again
+    [row.done || {}, o.done || {}].forEach(function (dn) { Object.keys(dn).forEach(function (p) { if (dn[p] && dn[p] !== 'skip' && (p !== 'yt' || /^https:/.test(dn[p]))) { it.done = it.done || {}; if (!it.done[p]) it.done[p] = dn[p]; } }); });   // posted by hand = never again
     if (it.status === 'posting' && now - (it.postStart || 0) > 15 * 60e3) it.status = 'partial';   // a run was cut off: try again
     var left = ['ig', 'fb', 'yt'].filter(function (p) { return it.platforms[p] && !(it.done || {})[p]; }), leftReady = left.filter(ready_);
     if (!left.length) it.status = 'posted';
@@ -285,8 +285,8 @@ function checkViews() { P.deleteProperty('VIEWS_AT'); var o = syncViews_(); Logg
 var norm_ = function (t) { return String(t || '').split('\n')[0].toLowerCase().replace(/[^a-z0-9%$]+/g, ' ').trim(); };
 function findPosted_(q, d, ov) {
   var tok = P.getProperty('META_PAGE_TOKEN'), ig = P.getProperty('IG_USER_ID'), page = P.getProperty('META_PAGE_ID'); if (!tok) return false;
-  var igm = (fetch_(GRAPH + '/' + ig + '/media?fields=caption,permalink,timestamp&limit=30&access_token=' + tok).data || []);
-  var fbm = []; try { fbm = fetch_(GRAPH + '/' + page + '/video_reels?fields=id,description,permalink_url,created_time&limit=30&access_token=' + tok).data || []; } catch (e) { Logger.log('fb reels list: ' + e.message); }
+  var igm = (fetch_(GRAPH + '/' + ig + '/media?fields=caption,permalink,timestamp&limit=60&access_token=' + tok).data || []);
+  var fbm = []; try { fbm = fetch_(GRAPH + '/' + page + '/video_reels?fields=id,description,permalink_url,created_time&limit=60&access_token=' + tok).data || []; } catch (e) { Logger.log('fb reels list: ' + e.message); }
   var ch = false;
   q.items.forEach(function (it) {
     if (!/^e-/.test(it.id) || !it.k) return;
@@ -294,8 +294,8 @@ function findPosted_(q, d, ov) {
     var since = dueMs_(it) - 5 * 86400e3;
     var hit = function (txt, when) { var n = norm_(txt); return n && keys.indexOf(n) >= 0 && new Date(when).getTime() >= since; };
     var mine = false;
-    if (!(it.done || {}).ig) igm.forEach(function (m) { if (!(it.done || {}).ig && hit(m.caption, m.timestamp)) { it.done = it.done || {}; it.done.ig = m.permalink; ch = mine = true; } });
-    if (!(it.done || {}).fb) fbm.forEach(function (m) { if (!(it.done || {}).fb && hit(m.description, m.created_time)) { it.done = it.done || {}; it.done.fb = /^http/.test(m.permalink_url || '') ? (m.permalink_url.indexOf('http') === 0 ? m.permalink_url : 'https://www.facebook.com' + m.permalink_url) : 'https://www.facebook.com/reel/' + m.id; ch = mine = true; } });
+    if (!/^https:/.test((it.done || {}).ig || '')) igm.forEach(function (m) { if (!/^https:/.test((it.done || {}).ig || '') && hit(m.caption, m.timestamp)) { it.done = it.done || {}; it.done.ig = m.permalink; ch = mine = true; } });
+    if (!/^https:/.test((it.done || {}).fb || '')) fbm.forEach(function (m) { if (!/^https:/.test((it.done || {}).fb || '') && hit(m.description, m.created_time)) { it.done = it.done || {}; it.done.fb = /^http/.test(m.permalink_url || '') ? (m.permalink_url.indexOf('http') === 0 ? m.permalink_url : 'https://www.facebook.com' + m.permalink_url) : 'https://www.facebook.com/reel/' + m.id; ch = mine = true; } });
     if (mine) { var left = ['ig', 'fb', 'yt'].filter(function (p) { return (it.platforms || {})[p] && !(it.done || {})[p] && ready_(p); }); if (!left.length && it.status !== 'posted') it.status = Object.keys(it.done).length >= ['ig', 'fb', 'yt'].filter(function (p) { return (it.platforms || {})[p]; }).length ? 'posted' : 'partial'; }
   });
   return ch;
@@ -308,6 +308,7 @@ function report_(id, quiet) {   // write status + ticks + links back to the Task
   var sig = JSON.stringify([st, err, it.done || {}]); if (sig === it.repSig) return;
   var patch = { apSt: st, apErr: err.slice(0, 290), done: {} };
   Object.keys(it.done || {}).forEach(function (p) { if (/^https:/.test(it.done[p])) patch.done[p] = it.done[p]; });
+  if ((it.platforms || {}).yt !== false && !/^https:/.test((it.done || {}).yt || '')) patch.done.yt = '';   // YouTube tick = a real channel link only
   var r = UrlFetchApp.fetch(SITE + '/api/plan', { method: 'post', contentType: 'application/json', headers: { 'x-pin': pin }, payload: JSON.stringify({ id: id, patch: patch }), muteHttpExceptions: true });
   if (r.getResponseCode() === 200) { it.repSig = sig; save_(q); }
 }
@@ -406,17 +407,19 @@ function postYT_(it, text) {
   var init = UrlFetchApp.fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status,recordingDetails', { method: 'post', muteHttpExceptions: true,
     contentType: 'application/json; charset=UTF-8', headers: { Authorization: 'Bearer ' + tok, 'X-Upload-Content-Type': 'video/mp4', 'X-Upload-Content-Length': String(size) }, payload: JSON.stringify(meta) });
   if (init.getResponseCode() >= 300) throw new Error('youtube init ' + init.getContentText().slice(0, 200));
-  var loc = init.getHeaders()['Location'] || init.getHeaders()['location'], v = null, CH = 32 * 1024 * 1024;   // 32 MB pieces: any video size works
+  var loc = init.getHeaders()['Location'] || init.getHeaders()['location'], v = null, CH = 8 * 1024 * 1024;   // 8 MB pieces as Blobs (no byte arrays): any video size, low memory
   for (var a = 0; a < size && !v; a += CH) {
     var b = Math.min(size, a + CH) - 1;
-    var part = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + it.fileId + '?alt=media', { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), Range: 'bytes=' + a + '-' + b } }).getBlob().getBytes();
+    var part = UrlFetchApp.fetch('https://www.googleapis.com/drive/v3/files/' + it.fileId + '?alt=media', { headers: { Authorization: 'Bearer ' + ScriptApp.getOAuthToken(), Range: 'bytes=' + a + '-' + b } }).getBlob();
     var up = UrlFetchApp.fetch(loc, { method: 'put', muteHttpExceptions: true, contentType: 'video/mp4', payload: part, headers: { Authorization: 'Bearer ' + tok, 'Content-Range': 'bytes ' + a + '-' + b + '/' + size } });
     var c = up.getResponseCode(); if (c === 200 || c === 201) v = JSON.parse(up.getContentText()); else if (c !== 308) throw new Error('youtube upload ' + c + ' ' + up.getContentText().slice(0, 160));
   }
   if (!v) throw new Error('youtube upload did not finish');
-  var th = UrlFetchApp.fetch('https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=' + v.id, { method: 'post', contentType: 'image/jpeg',   // strict: always try, report failures
-    payload: DriveApp.getFileById(it.ytCoverId || it.coverId).getBlob().getBytes(), headers: { Authorization: 'Bearer ' + tok }, muteHttpExceptions: true });   // YouTube needs a JPG under 2 MB (ytCoverId)
-  if (th.getResponseCode() >= 300) warn_(it, 'youtube thumbnail' + (short ? ' (Short: set the cover by hand in the YouTube app)' : '') + ': ' + th.getContentText().slice(0, 160));
+  try {   // the video is already up here: a cover problem must never stop or repeat the upload
+    var th = UrlFetchApp.fetch('https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId=' + v.id, { method: 'post', contentType: 'image/jpeg',   // strict: always try, report failures
+      payload: DriveApp.getFileById(it.ytCoverId || it.coverId).getBlob().getBytes(), headers: { Authorization: 'Bearer ' + tok }, muteHttpExceptions: true });   // YouTube needs a JPG under 2 MB (ytCoverId)
+    if (th.getResponseCode() >= 300) warn_(it, 'youtube thumbnail' + (short ? ' (Short: set the cover by hand in the YouTube app)' : '') + ': ' + th.getContentText().slice(0, 160));
+  } catch (e) { warn_(it, 'youtube thumbnail: ' + e.message); }
   return short ? 'https://www.youtube.com/shorts/' + v.id : 'https://www.youtube.com/watch?v=' + v.id;
 }
 function warn_(it, msg) { (it.warns = it.warns || []).push(new Date().toISOString() + ' ' + msg); }   // saved with the item; shown + mailed after posting
@@ -496,7 +499,7 @@ function testYT() {
 
 /* ---------------- YouTube catch-up (Nov 14, channel connected by Kuldeep sir) ----------------
    ytChannel_(): every video on the GradeNext channel (incl. private / scheduled).  ytFix(): ticks = what is really on YouTube.
-   ytBacklog_(): approved videos that never reached YouTube go up 2 a day (09:00 and 15:00 San Francisco) until none are left. */
+   ytBacklog_(): approved videos that never reached YouTube go up one per 5-min run until YouTube daily limit, then continue next day. */
 var YT_SKIP = ['e-x08'];   // Dr. Shahid's own draft in Studio: never upload again
 function ytNorm_(s) { return String(s || '').toLowerCase().replace(/#\w+/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
 function ytChannel_() {
@@ -509,7 +512,7 @@ function ytChannel_() {
   return out;
 }
 function ytMatch_(it, ch) { var id = String((it.done || {}).yt || '').match(/(?:shorts\/|v=)([\w-]{11})/); if (id) { var a = ch.filter(function (c) { return c.id === id[1]; })[0]; if (a) return a; }
-  var t = ytNorm_(it.title); return t ? ch.filter(function (c) { return c.n === t || c.n.indexOf(t) === 0 || t.indexOf(c.n) === 0 && c.n.length > 12; })[0] : null; }
+  var t = ytNorm_(it.title); return t ? ch.filter(function (c) { return c.n === t || (c.n.indexOf(t) === 0 || t.indexOf(c.n) === 0 && c.n.length > 12) && Math.abs(c.n.length - t.length) < 12; })[0] : null; }
 function ytUrl_(c, it) { return (it.ytKind === 'video' ? 'https://www.youtube.com/watch?v=' : 'https://www.youtube.com/shorts/') + c.id; }
 function ytFix() {   // run any time: makes every YouTube tick match the real channel
   var q = load_(), ch = ytChannel_(), n = 0, rep = [];
@@ -520,21 +523,60 @@ function ytFix() {   // run any time: makes every YouTube tick match the real ch
   Logger.log('channel videos: ' + ch.length + ' | fixed ticks: ' + n + ' ' + rep.join(' ')); return ch;
 }
 function ytViews_() { var q = load_(), ch = ytChannel_(), o = {}; q.items.forEach(function (it) { var c = ytMatch_(it, ch); if (c && it.k) o[it.k] = c.views; }); return o; }
-function ytBacklog_() {
+function ytBacklog_(max) {   // Nov 14: clear the whole backlog fast. Every 5-min run posts the next one, until YouTube's daily limit; then it goes on next day.
   if (!P.getProperty('YT_REFRESH_TOKEN')) return;
-  var now = new Date(), day = Utilities.formatDate(now, TZ, 'yyyy-MM-dd'), hm = Utilities.formatDate(now, TZ, 'HH:mm'), slot = hm >= '15:00' ? 'b' : hm >= '09:00' ? 'a' : '';
-  if (!slot || P.getProperty('YT_BACKLOG_' + slot) === day) return;
+  var t0 = Date.now(), day = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'), n = 0; max = max || 1;
+  if (P.getProperty('YT_QUOTA_DAY') === day) return;
+  var bad = JSON.parse(P.getProperty('YT_BAD') || '{}');
   var q = load_(), ch = ytChannel_();
-  var todo = q.items.filter(function (it) { var pl = it.platforms || {}; return it.approved && it.fileId && pl.yt !== false && YT_SKIP.indexOf(it.id) < 0 && !(it.done || {}).yt && it.date && it.date < day && (it.status === 'posted' || it.status === 'partial' || it.status === 'missed'); })
+  var todo = q.items.filter(function (it) { var pl = it.platforms || {}; return it.approved && it.fileId && pl.yt !== false && YT_SKIP.indexOf(it.id) < 0 && !(it.done || {}).yt && (bad[it.id] || 0) < 3 && it.date && it.date < day && (it.status === 'posted' || it.status === 'partial' || it.status === 'missed'); })
     .sort(function (a, b) { return (a.date + a.time).localeCompare(b.date + b.time); });
-  P.setProperty('YT_BACKLOG_' + slot, day);
-  for (var i = 0; i < todo.length; i++) { var it = todo[i], c = ytMatch_(it, ch);
-    if (c) { it.done = it.done || {}; it.done.yt = ytUrl_(c, it); log_(q, it.id, 'yt already on channel ' + it.done.yt); save_(q); report_(it.id); continue; }
-    var url = postYT_(it, (it.caption || '') + (it.hashtags ? '\n\n' + it.hashtags : ''));
-    var fq = load_(), fx = find_(fq, it.id); fx.done = fx.done || {}; fx.done.yt = url; log_(fq, it.id, 'yt backlog posted ' + url); save_(fq); report_(it.id);
-    return;   // one per slot
+  for (var i = 0; i < todo.length && n < max && Date.now() - t0 < 240000; i++) { var it = todo[i], c = ytMatch_(it, ch);
+    if (c) { var mq = load_(), mx = find_(mq, it.id); mx.done = mx.done || {}; mx.done.yt = ytUrl_(c, it); log_(mq, it.id, 'yt already on channel ' + mx.done.yt); save_(mq); report_(it.id); continue; }
+    bad[it.id] = (bad[it.id] || 0) + 1; P.setProperty('YT_BAD', JSON.stringify(bad));   // counted before the try: a crash also counts, so one bad video never blocks the rest
+    try { var url = postYT_(it, (it.caption || '') + (it.hashtags ? '\n\n' + it.hashtags : '')); }
+    catch (e) { if (/quota|rateLimit|uploadLimit/i.test(e.message)) { P.setProperty('YT_QUOTA_DAY', day); Logger.log('yt backlog: daily limit reached, goes on tomorrow'); return; }
+      Logger.log('yt backlog ' + it.id + ': ' + e.message); continue; }
+    var fq = load_(), fx = find_(fq, it.id); fx.done = fx.done || {}; fx.done.yt = url; log_(fq, it.id, 'yt backlog posted ' + url); save_(fq); report_(it.id); n++;
+    Logger.log('yt backlog posted ' + it.id + ' ' + url);
   }
 }
+function ytClean() {   // Nov 14: YouTube ticks must be real channel links. Removes plain ticks and the Short that was matched to the long video.
+  var q = load_(), rep = [];
+  q.items.forEach(function (it) { var y = (it.done || {}).yt; if (!y) return;
+    if (!/^https:/.test(y) || (it.id === 'e-sh1' && y.indexOf('rM25WgXyKz4') >= 0)) { delete it.done.yt; it.repSig = ''; rep.push(it.id); log_(q, it.id, 'yt tick removed: not a real YouTube link'); } });
+  save_(q); rep.forEach(function (id) { try { report_(id); } catch (e) {} }); Logger.log('cleaned: ' + rep.join(' '));
+}
+function ytBacklogNow() { ytBacklog_(4); ytBacklogList(); }
 function ytBacklogList() { var q = load_(), day = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'); Logger.log(q.items.filter(function (it) { var pl = it.platforms || {}; return it.approved && it.fileId && pl.yt !== false && YT_SKIP.indexOf(it.id) < 0 && !(it.done || {}).yt && it.date < day; }).map(function (it) { return it.id + ' ' + it.date + ' ' + it.status; }).join('\n')); }
 
 function fbRepostStatus() { Logger.log(P.getProperty('FB_REPOST_DONE')); var q = load_(); FB_REPOST_.forEach(function (r) { var it = find_(q, r[0]); Logger.log(r[0] + ' ' + r[1] + ' ' + r[2] + ' fb=' + (it && it.done && it.done.fb) + ' old=' + (it && it.oldFb)); }); }
+
+function linkFind() {   // Nov 14: real Instagram/Facebook links for posts that only have a plain tick (e-x15)
+  var tok = P.getProperty('META_PAGE_TOKEN'), ig = P.getProperty('IG_USER_ID'), page = P.getProperty('META_PAGE_ID');
+  var igm = fetch_(GRAPH + '/' + ig + '/media?fields=caption,permalink,timestamp&limit=80&access_token=' + tok).data || [];
+  var fbm = fetch_(GRAPH + '/' + page + '/video_reels?fields=id,description,permalink_url,created_time&limit=80&access_token=' + tok).data || [];
+  var q = load_(), rep = [];
+  q.items.forEach(function (it) { var d = it.done || {}, keys = [norm_(it.title), norm_(it.caption)].filter(function (x) { return x.length > 10; }).map(function (x) { return x.split(' ').slice(0, 4).join(' '); });
+    if (!keys.length) return;
+    var hit = function (t) { var n = norm_(t); return n && keys.some(function (k) { return n.indexOf(k) === 0; }); };
+    if (d.ig && !/^https:/.test(d.ig)) igm.forEach(function (m) { if (!/^https:/.test(it.done.ig) && hit(m.caption)) { it.done.ig = m.permalink; rep.push(it.id + ' ig'); } });
+    if (d.fb && !/^https:/.test(d.fb)) fbm.forEach(function (m) { if (!/^https:/.test(it.done.fb) && hit(m.description)) { it.done.fb = m.permalink_url && m.permalink_url.indexOf('http') === 0 ? m.permalink_url : 'https://www.facebook.com/reel/' + m.id; rep.push(it.id + ' fb'); } });
+  });
+  save_(q); rep.forEach(function (x) { try { report_(x.split(' ')[0]); } catch (e) {} }); Logger.log('linked: ' + rep.join(', ') + ' | ig posts ' + igm.length + ' fb reels ' + fbm.length);
+}
+function linkSearch() { var tok = P.getProperty('META_PAGE_TOKEN'), ig = P.getProperty('IG_USER_ID'), page = P.getProperty('META_PAGE_ID');
+  var igm = fetch_(GRAPH + '/' + ig + '/media?fields=caption,permalink,timestamp&limit=80&access_token=' + tok).data || [];
+  var fbm = fetch_(GRAPH + '/' + page + '/video_reels?fields=id,description,permalink_url,created_time&limit=80&access_token=' + tok).data || [];
+  igm.forEach(function (x) { if (/improv|progress/i.test(x.caption || '')) Logger.log('IG ' + x.timestamp + ' ' + x.permalink.split('/')[4] + ' ' + (x.caption || '').slice(0, 60)); });
+  fbm.forEach(function (x) { if (/improv|progress/i.test(x.description || '')) Logger.log('FB ' + x.created_time + ' ' + x.id + ' ' + (x.description || '').slice(0, 60)); });
+  var it = find_(load_(), 'e-x15'); Logger.log('x15: ' + it.title + ' | ' + (it.caption || '').slice(0, 60) + ' | ' + JSON.stringify(it.done).replace(/https?:/g, ''));
+}
+function fixX15() {   // Nov 14: x15 was ticked by hand on Instagram + Facebook but is not there (checked the last 80 posts). Untick and post it now.
+  var pin = P.getProperty('EDIT_PIN');
+  var r = UrlFetchApp.fetch(SITE + '/api/plan', { method: 'post', contentType: 'application/json', headers: { 'x-pin': pin }, payload: JSON.stringify({ id: 'e-x15', patch: { done: { ig: '', fb: '' } } }), muteHttpExceptions: true });
+  Logger.log('plan untick: ' + r.getResponseCode());
+  var q = load_(), it = find_(q, 'e-x15'); delete it.done.ig; delete it.done.fb; it.tries = 0; it.repSig = ''; log_(q, it.id, 'ig+fb ticks removed: not on Instagram/Facebook'); save_(q);
+  postItem_('e-x15'); report_('e-x15');
+  Logger.log(JSON.stringify(find_(load_(), 'e-x15').done).replace(/https?:/g, ''));
+}
