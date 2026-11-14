@@ -32,7 +32,30 @@ function save_(q) { q.log = (q.log || []).slice(-300); queueFile_().setContent(J
 function log_(q, id, msg) { q.log = q.log || []; q.log.push({ at: new Date().toISOString(), id: id, msg: String(msg).slice(0, 500) }); }
 
 /* ---------------- web API ---------------- */
-function doGet(e) { return json_(e && e.parameter && e.parameter.action === 'status' ? status_() : { items: load_().items }); }
+function doGet(e) {   // Nov 14: only used as the YouTube sign-in return page (Kuldeep sir connects the GradeNext channel once)
+  var p = (e && e.parameter) || {};
+  if (p.state === 'gnyt' && p.code) return ytCallback_(p.code);
+  if (p.state === 'gnyt' && p.error) return page_('YouTube was not connected', 'Google said: ' + p.error + '. Please open the link again and press Allow.', false);
+  return page_('GradeNext AutoPost', 'Running.', true);
+}
+function page_(h, t, ok) {
+  return HtmlService.createHtmlOutput('<div style="font:600 18px system-ui,sans-serif;max-width:520px;margin:80px auto;text-align:center;color:#1b1b1f">' +
+    '<div style="width:72px;height:72px;border-radius:50%;margin:0 auto 18px;display:grid;place-items:center;background:' + (ok ? '#3FBF75' : '#F87171') + ';color:#fff;font-size:38px">' + (ok ? '&#10003;' : '!') + '</div>' +
+    '<h1 style="font-size:26px;margin:0 0 10px">' + h + '</h1><p style="color:#555;font-weight:500">' + t + '</p></div>').setTitle(h);
+}
+function ytCallback_(code) {   // swap the sign-in code for a permanent token, then make sure it is the GradeNext channel
+  try {
+    var r = fetch_('https://oauth2.googleapis.com/token', { method: 'post', payload: { code: code, client_id: P.getProperty('YT_CLIENT_ID'), client_secret: P.getProperty('YT_CLIENT_SECRET'),
+      redirect_uri: ScriptApp.getService().getUrl(), grant_type: 'authorization_code' } });
+    if (!r.refresh_token) return page_('Almost', 'Google did not give a lasting key. Please open the link again (it must ask you to Allow).', false);
+    var ch = JSON.parse(UrlFetchApp.fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: 'Bearer ' + r.access_token }, muteHttpExceptions: true }).getContentText());
+    var it = (ch.items || [])[0];
+    if (!it || it.id !== YT_CHANNEL) return page_('Wrong channel', 'You picked ' + (it ? it.snippet.title : 'no channel') + '. Please open the link again and choose <b>GradeNext</b>.', false);
+    P.setProperty('YT_REFRESH_TOKEN', r.refresh_token);
+    try { MailApp.sendEmail(Session.getEffectiveUser().getEmail(), 'GradeNext: YouTube auto-post is connected', 'The GradeNext channel was connected at ' + new Date() + '. Approved videos now post to YouTube automatically.'); } catch (e) {}
+    return page_('YouTube connected', 'GradeNext channel is linked. Approved videos will now post to YouTube automatically. You can close this page.', true);
+  } catch (e) { return page_('Not connected', String(e.message || e).slice(0, 200) + '<br>Please open the link again.', false); }
+}
 function doPost(e) {
   var b = {}; try { b = JSON.parse(e.postData.contents); } catch (x) { return json_({ error: 'bad json' }); }
   if (b.action === 'list') return json_({ items: load_().items });
@@ -71,11 +94,62 @@ function runDue() {   // every 5 min, 24/7 on Google's servers. One run at a tim
   try {
     try { syncSite_(); } catch (e) { Logger.log('site sync failed: ' + e.message); }
     try { if (Date.now() - Number(P.getProperty('VIEWS_AT') || 0) > 55 * 60e3) syncViews_(); } catch (e) { Logger.log('views sync failed: ' + e.message); }
+    try { notifyRemakes_(); } catch (e) { Logger.log('remake mail failed: ' + e.message); }
+    try { repostFb_(); } catch (e) { Logger.log('fb repost failed: ' + e.message); }
+    try { ytBacklog_(); } catch (e) { Logger.log('yt backlog: ' + e.message); }
+    try { repostFbDue_(); } catch (e) { Logger.log('fb repost failed: ' + e.message); }
     var q = load_(), now = Date.now(), t0 = Date.now();
     q.items.filter(function (it) { return due_(it, now); })
       .sort(function (a, b) { return dueMs_(a) - dueMs_(b); })
       .forEach(function (it) { if (Date.now() - t0 < 150000) { postItem_(it.id); report_(it.id); } });   // Apps Script runs max 6 min: the rest posts on the next run
   } finally { lock.releaseLock(); }
+}
+/* Nov 13: the 7 Facebook reels posted while the Meta app was still in test mode (hidden, 0 views) are posted again, one per day at a
+   good time for US parents (weekday 7 PM PT, weekend 10 AM PT). The plan is in REPOST_PLAN below; done ones are kept in Script Property FB_REPOST_DONE. */
+var REPOST_PLAN = [['e-x08', '2026-11-12', '19:00'], ['e-x09', '2026-11-13', '19:00'], ['e-sh1', '2026-11-14', '10:00'], ['e-x10', '2026-11-15', '10:00'],
+                   ['e-x04', '2026-11-16', '19:00'], ['e-x22', '2026-11-17', '19:00'], ['e-x20', '2026-11-18', '19:00']];
+function repostFbDue_() {
+  if (!P.getProperty('META_PAGE_TOKEN')) return;
+  var done = JSON.parse(P.getProperty('FB_REPOST_DONE') || '{}'), now = Date.now();
+  REPOST_PLAN.forEach(function (r) {
+    if (done[r[0]]) return; var ms = dueMs_({ date: r[1], time: r[2] }); if (now < ms || now - ms > 6 * 3600e3) return;   // only inside its own 6-hour window
+    var q = load_(), it = find_(q, r[0]); if (!it || !it.fileId) { done[r[0]] = 'missing'; return; }
+    done[r[0]] = 'posting'; P.setProperty('FB_REPOST_DONE', JSON.stringify(done));   // never twice, even if this run is cut off
+    var text = (it.caption || '') + (it.hashtags ? '\n\n' + it.hashtags : '');
+    try { var url = postFB_(it, text); done[r[0]] = url; it.done = it.done || {}; it.done.fb = url; it.repSig = ''; log_(q, r[0], 'fb REPOSTED ' + url); save_(q); report_(r[0]); }
+    catch (e) { done[r[0]] = 'failed: ' + e.message.slice(0, 150); MailApp.sendEmail(P.getProperty('ALERT_MAIL') || Session.getEffectiveUser().getEmail(), 'GradeNext: Facebook repost failed ' + r[0], e.message); }
+    P.setProperty('FB_REPOST_DONE', JSON.stringify(done));
+  });
+}
+/* Nov 13 (Aryan's go): repost on Facebook the 7 reels that were hidden while the Meta app was still in test mode (0 views).
+   Best IG performers first, one at a time, 09:00 and 12:00 PT (9 AM is our best time on the Analysis numbers). Old reels are kept. */
+var FB_REPOST_ = [['e-x08', '2026-11-13', '09:00'], ['e-x09', '2026-11-13', '12:00'], ['e-x10', '2026-11-14', '09:00'], ['e-x04', '2026-11-14', '12:00'],
+                  ['e-x22', '2026-11-15', '09:00'], ['e-sh1', '2026-11-15', '12:00'], ['e-x20', '2026-11-16', '09:00']];
+function repostFb_() {
+  if (!P.getProperty('META_PAGE_TOKEN')) return;
+  var done = JSON.parse(P.getProperty('FB_REPOST_DONE') || '{}'), now = Date.now();
+  for (var i = 0; i < FB_REPOST_.length; i++) {
+    var r = FB_REPOST_[i]; if (done[r[0]]) continue;
+    var ms = dueMs_({ date: r[1], time: r[2] }); if (now < ms) break;
+    if (now - ms > 36 * 3600e3) { done[r[0]] = 'skipped: too late'; continue; }
+    var q = load_(), it = find_(q, r[0]); if (!it || !it.fileId || !it.coverId) { done[r[0]] = 'skipped: no video/cover'; continue; }
+    try {
+      var url = postFB_(it, (it.caption || '') + (it.hashtags ? '\n\n' + it.hashtags : ''));
+      done[r[0]] = url; it.done = it.done || {}; it.oldFb = it.done.fb || ''; it.done.fb = url; it.repSig = ''; log_(q, r[0], 'fb REPOSTED ' + url + ' (old hidden reel ' + it.oldFb + ')'); save_(q);
+      P.setProperty('FB_REPOST_DONE', JSON.stringify(done)); report_(r[0]);
+    } catch (e) { var n = (done['_err_' + r[0]] || 0) + 1; done['_err_' + r[0]] = n; if (n >= 3) { done[r[0]] = 'failed: ' + e.message; MailApp.sendEmail(P.getProperty('ALERT_MAIL') || Session.getEffectiveUser().getEmail(), 'GradeNext: Facebook repost failed ' + r[0], e.message); } }
+    break;   // one repost per run
+  }
+  P.setProperty('FB_REPOST_DONE', JSON.stringify(done));
+}
+/* Nov 13: team re-uploads (re-edit / record again) -> one e-mail to Aryan saying if the video is posted, in the queue or waiting, and its Remade number. */
+function notifyRemakes_() {
+  var pin = P.getProperty('EDIT_PIN'); if (!pin) return;
+  var r = UrlFetchApp.fetch(SITE + '/api/remake?pending=1', { headers: { 'x-pin': pin }, muteHttpExceptions: true }); if (r.getResponseCode() !== 200) return;
+  var list = JSON.parse(r.getContentText()).list || []; if (!list.length) return;
+  var body = list.map(function (x) { return '• ' + x.id + (x.who ? ' (' + x.who + ')' : '') + ': ' + x.msg + (x.file ? '\n  file: ' + x.file : ''); }).join('\n\n');
+  MailApp.sendEmail(P.getProperty('ALERT_MAIL') || Session.getEffectiveUser().getEmail(), 'GradeNext: ' + list.length + ' video' + (list.length > 1 ? 's' : '') + ' re-edited / recorded again', body + '\n\n' + SITE + '/#approval');
+  UrlFetchApp.fetch(SITE + '/api/remake', { method: 'post', contentType: 'application/json', headers: { 'x-pin': pin }, payload: JSON.stringify({ sent: list.map(function (x) { return x.at; }) }), muteHttpExceptions: true });
 }
 function due_(it, now) {
   if (!it.approved || it.auto === false || !it.date || !it.time) return false;
@@ -200,6 +274,7 @@ function syncViews_() {
     if (fv && !o.d) { try { var ct = fetch_(GRAPH + '/' + fv + '?fields=created_time&access_token=' + tok).created_time; if (ct) o.d = Utilities.formatDate(new Date(String(ct).replace(/\+0000$/, 'Z')), TZ, 'yyyy-MM-dd'); } catch (e) {} }
     if (Object.keys(o).length) out[k] = o;
   });
+  try { var Y = ytViews_(); Object.keys(Y).forEach(function (k) { out[k] = out[k] || {}; out[k].yt = Y[k]; }); } catch (e) { Logger.log('yt views: ' + e.message); }   // Nov 14: YouTube views too
   var res = UrlFetchApp.fetch(SITE + '/api/stats', { method: 'post', contentType: 'application/json', headers: { 'x-pin': pin }, payload: JSON.stringify({ v: out }), muteHttpExceptions: true });
   P.setProperty('VIEWS_AT', String(Date.now())); Logger.log('views sent for ' + Object.keys(out).length + ' videos: ' + res.getContentText().slice(0, 100));
   return out;
@@ -297,6 +372,25 @@ function postFB_(it, text) {
   catch (e) { warn_(it, 'facebook cover: ' + e.message); }
   return 'https://www.facebook.com/reel/' + s.video_id;
 }
+/* One-time YouTube setup (Nov 13): Script Properties YT_CLIENT_ID + YT_CLIENT_SECRET (from the Google Cloud OAuth client) and
+   YT_AUTH_CODE (the "code=" from the sign-in link, where the GradeNext channel was picked). Run connectYouTube():
+   it swaps the code for a permanent refresh token, checks it is the GradeNext channel, and deletes the code. */
+var YT_CHANNEL = 'UCYYqF7G1xmjTcZCfRt5U05Q';   // GradeNext (brand channel) - posts only ever go here
+function connectYouTube() {
+  var code = (P.getProperty('YT_AUTH_CODE') || '').trim();
+  if (code) {
+    code = decodeURIComponent(code.replace(/^.*[?&]code=/, '').replace(/&.*$/, ''));
+    var r = fetch_('https://oauth2.googleapis.com/token', { method: 'post', payload: { code: code, client_id: P.getProperty('YT_CLIENT_ID'), client_secret: P.getProperty('YT_CLIENT_SECRET'),
+      redirect_uri: 'https://developers.google.com/oauthplayground', grant_type: 'authorization_code' } });
+    P.deleteProperty('YT_AUTH_CODE');
+    if (!r.refresh_token) throw new Error('No refresh token returned - open the sign-in link again (it must ask for consent).');
+    P.setProperty('YT_REFRESH_TOKEN', r.refresh_token);
+  }
+  var ch = JSON.parse(UrlFetchApp.fetch('https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true', { headers: { Authorization: 'Bearer ' + ytToken_() }, muteHttpExceptions: true }).getContentText());
+  var it = (ch.items || [])[0];
+  if (!it || it.id !== YT_CHANNEL) { P.deleteProperty('YT_REFRESH_TOKEN'); throw new Error('Wrong channel: ' + (it ? it.snippet.title + ' ' + it.id : JSON.stringify(ch).slice(0, 200)) + ' - sign in again and pick GradeNext (' + YT_CHANNEL + ').'); }
+  Logger.log('YouTube ready: ' + it.snippet.title + ' (' + it.id + ')');
+}
 /* ---- YouTube: resumable upload with the channel's own refresh token (works for Brand channels) ---- */
 function ytToken_() {
   var r = fetch_('https://oauth2.googleapis.com/token', { method: 'post', payload: { client_id: P.getProperty('YT_CLIENT_ID'), client_secret: P.getProperty('YT_CLIENT_SECRET'),
@@ -384,3 +478,63 @@ function setupTrigger() {   // run once
 }
 /* Nov 7: the website's storage was moved (old data unreadable). Run once: sends every task's real status, ticks and links back to the site. */
 function resyncSite() { var q = load_(); q.items.forEach(function (it) { delete it.repSig; }); save_(q); syncSite_(); Logger.log('resynced ' + load_().items.length + ' items'); }
+
+/* Check (Nov 14): upload one approved video to YouTube as PRIVATE, confirm it worked, then delete it. Nothing public. */
+function testYT() {
+  var q = load_(), c = q.items.filter(function (x) { return x.fileId; }).slice(-12).map(function (x) { try { return [x, DriveApp.getFileById(x.fileId).getSize()]; } catch (e) { return null; } }).filter(String).sort(function (a, b) { return a[1] - b[1]; })[0];
+  var it = c[0], tok = ytToken_(), blob = DriveApp.getFileById(it.fileId).getBlob();
+  var init = UrlFetchApp.fetch('https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status', { method: 'post', muteHttpExceptions: true, contentType: 'application/json',
+    headers: { Authorization: 'Bearer ' + tok, 'X-Upload-Content-Type': 'video/mp4' }, payload: JSON.stringify({ snippet: { title: 'Pulse test - deleting', description: 'auto test' }, status: { privacyStatus: 'private', selfDeclaredMadeForKids: false } }) });
+  if (init.getResponseCode() >= 300) throw new Error('init ' + init.getContentText().slice(0, 300));
+  var up = UrlFetchApp.fetch(init.getHeaders()['Location'], { method: 'put', contentType: 'video/mp4', payload: blob.getBytes(), muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + tok } });
+  var v = JSON.parse(up.getContentText()); Logger.log('upload ' + up.getResponseCode() + ' id=' + v.id + ' channel=' + (v.snippet && v.snippet.channelId) + ' size=' + c[1]);
+  var del = UrlFetchApp.fetch('https://www.googleapis.com/youtube/v3/videos?id=' + v.id, { method: 'delete', muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + tok } });
+  Logger.log('delete ' + del.getResponseCode());
+  var due = q.items.filter(function (x) { return x.platforms && x.platforms.yt && !(x.done && x.done.yt); }).map(function (x) { return x.id + ' ' + x.date + ' ' + x.time + (x.approved ? ' approved' : ' waiting'); });
+  Logger.log('YouTube still to post: ' + due.length + '\n' + due.slice(0, 25).join('\n'));
+}
+
+/* ---------------- YouTube catch-up (Nov 14, channel connected by Kuldeep sir) ----------------
+   ytChannel_(): every video on the GradeNext channel (incl. private / scheduled).  ytFix(): ticks = what is really on YouTube.
+   ytBacklog_(): approved videos that never reached YouTube go up 2 a day (09:00 and 15:00 San Francisco) until none are left. */
+var YT_SKIP = ['e-x08'];   // Dr. Shahid's own draft in Studio: never upload again
+function ytNorm_(s) { return String(s || '').toLowerCase().replace(/#\w+/g, '').replace(/[^a-z0-9]+/g, ' ').trim(); }
+function ytChannel_() {
+  var h = { Authorization: 'Bearer ' + ytToken_() }, get = function (u) { return JSON.parse(UrlFetchApp.fetch(u, { headers: h, muteHttpExceptions: true }).getContentText()); };
+  var up = get('https://www.googleapis.com/youtube/v3/channels?part=contentDetails&mine=true').items[0].contentDetails.relatedPlaylists.uploads, ids = [], tok = '';
+  for (var n = 0; n < 10; n++) { var p = get('https://www.googleapis.com/youtube/v3/playlistItems?part=contentDetails&maxResults=50&playlistId=' + up + (tok ? '&pageToken=' + tok : '')); (p.items || []).forEach(function (i) { ids.push(i.contentDetails.videoId); }); tok = p.nextPageToken; if (!tok) break; }
+  var out = [];
+  for (var i = 0; i < ids.length; i += 50) get('https://www.googleapis.com/youtube/v3/videos?part=snippet,status,statistics&id=' + ids.slice(i, i + 50).join(',')).items.forEach(function (x) {
+    out.push({ id: x.id, title: x.snippet.title, n: ytNorm_(x.snippet.title), status: x.status.privacyStatus, publishAt: x.status.publishAt || '', views: +((x.statistics || {}).viewCount || 0) }); });
+  return out;
+}
+function ytMatch_(it, ch) { var id = String((it.done || {}).yt || '').match(/(?:shorts\/|v=)([\w-]{11})/); if (id) { var a = ch.filter(function (c) { return c.id === id[1]; })[0]; if (a) return a; }
+  var t = ytNorm_(it.title); return t ? ch.filter(function (c) { return c.n === t || c.n.indexOf(t) === 0 || t.indexOf(c.n) === 0 && c.n.length > 12; })[0] : null; }
+function ytUrl_(c, it) { return (it.ytKind === 'video' ? 'https://www.youtube.com/watch?v=' : 'https://www.youtube.com/shorts/') + c.id; }
+function ytFix() {   // run any time: makes every YouTube tick match the real channel
+  var q = load_(), ch = ytChannel_(), n = 0, rep = [];
+  q.items.forEach(function (it) { if (!it.fileId) return; var c = ytMatch_(it, ch), cur = (it.done || {}).yt || '';
+    if (c && cur !== ytUrl_(c, it)) { it.done = it.done || {}; it.done.yt = ytUrl_(c, it); n++; rep.push(it.id); log_(q, it.id, 'yt found on channel ' + it.done.yt + ' (' + c.status + ')'); }
+    else if (!c && cur) { delete it.done.yt; n++; rep.push(it.id); log_(q, it.id, 'yt tick removed: not on the channel'); } });
+  save_(q); rep.forEach(function (id) { try { report_(id); } catch (e) {} });
+  Logger.log('channel videos: ' + ch.length + ' | fixed ticks: ' + n + ' ' + rep.join(' ')); return ch;
+}
+function ytViews_() { var q = load_(), ch = ytChannel_(), o = {}; q.items.forEach(function (it) { var c = ytMatch_(it, ch); if (c && it.k) o[it.k] = c.views; }); return o; }
+function ytBacklog_() {
+  if (!P.getProperty('YT_REFRESH_TOKEN')) return;
+  var now = new Date(), day = Utilities.formatDate(now, TZ, 'yyyy-MM-dd'), hm = Utilities.formatDate(now, TZ, 'HH:mm'), slot = hm >= '15:00' ? 'b' : hm >= '09:00' ? 'a' : '';
+  if (!slot || P.getProperty('YT_BACKLOG_' + slot) === day) return;
+  var q = load_(), ch = ytChannel_();
+  var todo = q.items.filter(function (it) { var pl = it.platforms || {}; return it.approved && it.fileId && pl.yt !== false && YT_SKIP.indexOf(it.id) < 0 && !(it.done || {}).yt && it.date && it.date < day && (it.status === 'posted' || it.status === 'partial' || it.status === 'missed'); })
+    .sort(function (a, b) { return (a.date + a.time).localeCompare(b.date + b.time); });
+  P.setProperty('YT_BACKLOG_' + slot, day);
+  for (var i = 0; i < todo.length; i++) { var it = todo[i], c = ytMatch_(it, ch);
+    if (c) { it.done = it.done || {}; it.done.yt = ytUrl_(c, it); log_(q, it.id, 'yt already on channel ' + it.done.yt); save_(q); report_(it.id); continue; }
+    var url = postYT_(it, (it.caption || '') + (it.hashtags ? '\n\n' + it.hashtags : ''));
+    var fq = load_(), fx = find_(fq, it.id); fx.done = fx.done || {}; fx.done.yt = url; log_(fq, it.id, 'yt backlog posted ' + url); save_(fq); report_(it.id);
+    return;   // one per slot
+  }
+}
+function ytBacklogList() { var q = load_(), day = Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'); Logger.log(q.items.filter(function (it) { var pl = it.platforms || {}; return it.approved && it.fileId && pl.yt !== false && YT_SKIP.indexOf(it.id) < 0 && !(it.done || {}).yt && it.date < day; }).map(function (it) { return it.id + ' ' + it.date + ' ' + it.status; }).join('\n')); }
+
+function fbRepostStatus() { Logger.log(P.getProperty('FB_REPOST_DONE')); var q = load_(); FB_REPOST_.forEach(function (r) { var it = find_(q, r[0]); Logger.log(r[0] + ' ' + r[1] + ' ' + r[2] + ' fb=' + (it && it.done && it.done.fb) + ' old=' + (it && it.oldFb)); }); }
